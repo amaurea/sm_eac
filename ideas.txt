@@ -1,0 +1,32 @@
+Inline assembly in input file, processed by single program to produce final
+lsnes-compatible input file.
+
+F.|................|................|................|................
+# Bootstrapping functions. No prerequisites (other than total control),
+# but very slow.
+@load tbuffer nlag [nlag ...]
+assembly here
+Assembles the given assembly code to machine code, generates assembly for
+writing this word by word to the given address, and inserts the equivalent
+inputs into the input stream. nlag indicates the number of lag frames to
+insert after each useful frame. If a list of them is given, they indicate
+each frame individually, with the last one being repeated if necessary.
+Need a mechanism for returning the number of bytes written.
+@framecode nlag
+assembly here
+Assembles the given assembly code and inserts it directly as a single frame
+of input, followed by the given number of lag frames.
+# Main functions. Require our driver to be loaded.
+# NOTE: Remember to handle the first one of these after a frame of normal
+# input specially, since we need to change controller 2's input to indicate
+# the length of the following segment.
+# NOTE: An ldy #num should be inserted at the end of each chunk, indicating
+# the length of the next one
+@code
+assembly here
+Assembles the given assembly code and inserts it directly as subframe input,
+divided across as many subframes as necessary.
+@function address
+assembly here
+Assembles the given assembly code, and generates subframe input to place it
+as reusable code at the given address, without running it.

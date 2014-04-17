@@ -1,0 +1,249 @@
+"""Input assembler program for lsnes format input files. Expands directives in
+an input file, producing lsnes-compatible plain keypress data."""
+# Represent machine code and keypad data as numpy arrays of bytes.
+# numpy.fromstring and numpy.tostring make this convenient.
+# Given a file of text inputs interspaced with macros, first make
+# pass through it classifying each part, resulting in a list of
+#  NormalInput
+#  NormalInput
+#  NormalInput
+#  Inline
+#  Boot
+#  Inline
+#  NormalInput
+#  Code
+#  Code
+#  Code
+#  Function
+#  NormalInput
+# Etc. Then make a pass backwards through it, resolving all backwards
+# dependencies (only from classes that inherit from Resident so far).
+# Then make a final pass forwards, outputting the inputs and optionally
+# verbose information.
+#
+# Assembly code will be handled as a single string, not lists of lines.
+
+import argparse, re, sys, subprocess, numpy as np
+parser = argparse.ArgumentParser()
+parser.add_argument("ifile", nargs="?", default="-")
+parser.add_argument("ofile", nargs="?", default="-")
+args = parser.parse_args()
+
+npad=4
+bufsize=0x100
+
+def seprep(code):
+	expr = re.compile("\\b(sep|rep) +#(\$?[0-9a-zA-Z]+)\\b")
+	lines = code.split("\n")
+	olines = [".al: .xl"]
+	for line in lines:
+		subs = line.split(":")
+		osubs = []
+		for sub in subs:
+			m = expr.search(sub)
+			if m:
+				v = parse_int(m.group(2))
+				if m.group(1) == "sep":
+					if v&0x20: sub += ": .as"
+					if v&0x10: sub += ": .xs"
+				elif m.group(1) == "rep":
+					if v&0x20: sub += ": .al"
+					if v&0x10: sub += ": .xl"
+			osubs.append(sub)
+		olines.append(": ".join(osubs))
+	return "\n".join(olines)
+
+def assemble(code):
+	p = subprocess.Popen("xa -w -o - /dev/stdin", stdin=subprocess.PIPE,
+		stdout=subprocess.PIPE, shell=True)
+	out, err = p.communicate(seprep(code))
+	return np.fromstring(out,dtype=np.uint8)
+
+# Converting between bytes and lsnes input
+button_names = "BYsSudlrAXLR0123."
+def tobits(a): return np.unpackbits(a.view(np.uint8)[...,None],-1).reshape(a.shape+(-1,))
+def swapendian(a): return a.reshape(-1,2)[:,::-1].reshape(a.shape)
+def bytes2input(b,pre=".."):
+	"""Given a numpy array of bytes b, produce a string of
+	corresponding lsnes input with the given prefix
+	(typically .. or F.)."""
+	# Convert to full rows of input
+	nrow = (b.size+npad*2-1)/(npad*2)
+	data = np.zeros([nrow,npad*2],dtype=np.uint8)
+	data.reshape(-1)[:b.size] = b
+	# Then convert bit pattern to strings
+	data = tobits(swapendian(data).view(np.uint16))*np.arange(16,0,-1)[None,None]
+	chars= np.array([button_names[::-1]]).view("S1")[data].view("S16")[...,0]
+	return "\n".join(["|".join([pre]+[pad for pad in entry]) for entry in chars])
+def input2bytes(s):
+	"""Given a string containing an integer number of lsnes movie input lines,
+	returns their byte representation and the frame prefix."""
+	s = s.replace("\n","") # Get rid of newlines
+	chars = np.array([s]).view("S1").reshape(-1,2+(17*npad))[:,2:].reshape(-1,npad,17)[:,:,1:]
+	bits  = (chars != '.').astype(np.uint8)
+	return swapendian(np.packbits(bits)), s[:2]
+
+def ismacro(line): return line[0] == '@'
+def isnormal(line): return re.match("^..\|",line)
+def iscommand(line): return ismacro(line) or isnormal(line)
+def parse_int(s):
+	if s[0] == "$": s = "0x"+s[1:]
+	return int(s,0)
+def nbyte2nrec(i): return (i+2*npad-1)/(2*npad)
+
+lagframe = "|".join(["F."]+["."*16]*4)
+def addlag(inputs, nlag):
+	res = []
+	if len(nlag)==0: nlag=[0]
+	for i, s in enumerate(inputs.rsplit("\n")):
+		res.append(s)
+		for j in range(nlag[min(i,len(nlag)-1)]):
+			res.append(lagframe)
+	return "\n".join(res)
+
+class RawInput: pass
+class NormalInput(RawInput):
+	def __init__(self, line):
+		self.data = input2bytes(line)[0]
+	def toinput(self):
+		return bytes2input(self.data, "F.")
+class SubframeInput(RawInput):
+	def __init__(self, line):
+		self.data = input2bytes(line)[0]
+	def toinput(self):
+		return bytes2input(self.data, "..")
+
+class Inline:
+	def __init__(self, args, data):
+		self.nlag = [parse_int(a) for a in args]
+		self.asm  = data
+		self.code = assemble(data)
+	def toinput(self):
+		return addlag(bytes2input(self.code, "F."),self.nlag)
+
+class Boot:
+	def __init__(self, args, data):
+		self.addr = parse_int(args[0])
+		self.nlag = [parse_int(a) for a in args[1:]]
+		self.payload_asm  = data
+		self.payload_code = assemble(data)
+		cpad = np.pad(self.payload_code,[0,self.payload_code.size%2],mode="constant")
+		self.asm = "\n".join([
+"""lda #$%04x
+sta $%04x
+rts
+brk""" % (d,self.addr+2*i) for i,d in enumerate(cpad.view(np.uint16))])
+		self.code = assemble(self.asm)
+	def toinput(self):
+		return addlag(bytes2input(self.code, "F."),self.nlag)
+
+class Code:
+	def __init__(self, args, data):
+		self.payload_asm  = data
+		self.setnext(0)
+	def getcode(self):
+		return assemble("%s\nldy #$%04x\nrts" % (self.payload_asm,nbyte2nrec(self.nbyte_next)))
+	def setnext(self, val):
+		self._nnext = val
+		self.code = self.getcode()
+		self.nbyte = self.code.size
+	@property
+	def nbyte_next(self): return self._nnext
+	@nbyte_next.setter
+	def nbyte_next(self, value): self.setnext(value)
+	def toinput(self):
+		return bytes2input(self.code, "..")
+
+class Function(Code):
+	def __init__(self, args, data):
+		self.payload_asm  = data
+		self.payload_code = assemble(data)
+		self.addr = parse_int(args[0])
+		self.bufsize = parse_int(args[1]) if len(args) > 1 else bufsize
+		self.setnext(0)
+	def getcode(self):
+		ncopy, ncode = 17, len(self.payload_code)
+		bank = self.addr>>16 or 0x7e
+		res = []
+		# Bunch up our function code into chunks of safe length that
+		# fit inside our input buffer. This requires knowing the buffer
+		# length, which is currently hardcoded.
+		chunksize = self.bufsize-ncopy
+		for i in range(0, ncode, chunksize):
+			chunk = self.payload_code[i:i+chunksize]
+			n = len(chunk)
+			if i == 0: self.nbyte = n+ncopy
+			# Compute the length of the next chunk, in bytes
+			next_chunklen = min(ncode-(i+chunksize),chunksize)
+			nnext = next_chunklen+ncopy if next_chunklen > 0 else self.nbyte_next
+			# The mvn instruciton works by setting
+			# x=src, y=trg, a=n-1
+			# The -3 below is to compensate for the size of the per instruction
+			# Because we know source and target ranges won't overlap, it is
+			# safe to use mvn in both cases.
+			copy_asm = """per $%04x
+plx
+ldy #$%04x
+lda #$%04x
+mvn $7e%02x
+ldy #$%04x
+rts""" % (ncopy-3, self.addr+i, n-1, bank, nbyte2nrec(nnext))
+			res.append(assemble(copy_asm))
+			res.append(chunk)
+		return np.concatenate(res)
+
+def getdata(lines):
+	data = []
+	n=0
+	for dline in lines:
+		if iscommand(dline): break
+		n += 1
+		if dline[0] == '#': continue
+		data.append(dline.rstrip())
+	return "\n".join(data), n
+
+def parse(lines):
+	entries = []
+	i=-1
+	while True:
+		i+=1
+		if i >= len(lines): break
+		line = lines[i]
+		if line[0] == '#': continue
+		if line[0] == '@':
+			toks = line.split()
+			data,n = getdata(lines[i+1:])
+			i += n+1
+			if toks[0] == "@inline":
+				entries.append(Inline(toks[1:], data))
+			elif toks[0] == "@boot":
+				entries.append(Boot(toks[1:], data))
+			elif toks[0] == "@code":
+				entries.append(Code(toks[1:], data))
+			elif toks[0] == "@function":
+				entries.append(Function(toks[1:], data))
+		elif re.search("^..\|", line):
+			if line[0]=='F':
+				entries.append(NormalInput(line))
+			else:
+				entries.append(SubframeInput(line))
+		else:
+			raise ValueError("Unrecognized format: '%s'" % line.rstrip())
+	return entries
+
+ifile = open(args.ifile, "r") if args.ifile != "-" else sys.stdin
+lines = ifile.readlines()
+entries = parse(lines)
+# Update all dependencies
+for i in range(len(entries)-1,0,-1):
+	cur, prev = entries[i], entries[i-1]
+	if isinstance(cur, Code):
+		if isinstance(prev, Code):
+			prev.nbyte_next = cur.nbyte
+		elif isinstance(prev, NormalInput):
+			prev.data.view(np.uint16)[1] = nbyte2nrec(cur.nbyte)
+		else:
+			print >> sys.stderr, "Warning: could not attach code-type entry #%d to previous" % i
+ofile = open(args.ofile, "w") if args.ofile != "-" else sys.stdout
+for entry in entries:
+	ofile.write(entry.toinput()+"\n")

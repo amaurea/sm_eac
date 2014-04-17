@@ -31,6 +31,7 @@ parser.add_argument("ofile", nargs="?", default="-")
 args = parser.parse_args()
 
 npad=4
+pad_order=[0,2,1,3]
 global_defs = {}
 
 def seprep(code):
@@ -75,6 +76,7 @@ def bytes2input(b,pre=".."):
 	data.reshape(-1)[:b.size] = b
 	# Then convert bit pattern to strings
 	data = tobits(swapendian(data).view(np.uint16))*np.arange(16,0,-1)[None,None]
+	data = data[:,pad_order]
 	chars= np.array([button_names[::-1]]).view("S1")[data].view("S16")[...,0]
 	return "\n".join(["|".join([pre]+[pad for pad in entry]) for entry in chars])
 def input2bytes(s):
@@ -82,6 +84,7 @@ def input2bytes(s):
 	returns their byte representation and the frame prefix."""
 	s = s.replace("\n","") # Get rid of newlines
 	chars = np.array([s]).view("S1").reshape(-1,2+(17*npad))[:,2:].reshape(-1,npad,17)[:,:,1:]
+	chars[:,pad_order,:] = chars
 	bits  = (chars != '.').astype(np.uint8)
 	return swapendian(np.packbits(bits)), s[:2]
 

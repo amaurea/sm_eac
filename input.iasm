@@ -8,15 +8,19 @@ F.|........AX......|................|................|................
 F.|.........X......|................|................|................
 @global
  main            = $f440
+ main_long       = $7ef440
  bufaddr         = $f500
  run_every_frame = $f600
  tbuffer         = $01df
+# Make sure we're called repeatedly
 @inline 1
  lda #$4218
  sta $0c68
  ply
- rts
-@boot tbuffer 1
+# Bootstrap the following code, placing it at the previously defined
+# main_long, which is a region of free space in ram.
+# This will be our main loop later.
+@boot main_long 1
  ldx #bufaddr
  ldy $421a
  dataloop
@@ -55,3 +59,26 @@ F.|.........X......|................|................|................
  dey
  bne recloop
  rts
+# Set up our per-frame jump to the main loop
+@boot tbuffer 1
+ jmp main_long
+@inline 1
+ lda #tbuffer
+ sta $a42
+# At this point we're fully bootstrapped. We can now return control to the
+# game (but it will now call our resident function every frame)
+@inline 1
+ stz $0c40
+# We can now play the game normally...
+F.|.........X......|................|................|................
+F.|B......r........|................|................|................
+F.|B......r........|................|................|................
+F.|B......r........|................|................|................
+F.|B......r........|................|................|................
+F.|B......r........|................|................|................
+# And run large amounts of code any frame we want, at a far greater
+# speed than the bootstrapping code. This does not interfer with normal
+# input during this frame.
+@code
+ lda #$26
+ sta $998

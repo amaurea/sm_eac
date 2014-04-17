@@ -30,7 +30,7 @@ parser.add_argument("ofile", nargs="?", default="-")
 args = parser.parse_args()
 
 npad=4
-bufsize=0x100
+global_defs = {}
 
 def seprep(code):
 	expr = re.compile("\\b(sep|rep) +#(\$?[0-9a-zA-Z]+)\\b")
@@ -42,7 +42,7 @@ def seprep(code):
 		for sub in subs:
 			m = expr.search(sub)
 			if m:
-				v = parse_int(m.group(2))
+				v = parse_glob(m.group(2))
 				if m.group(1) == "sep":
 					if v&0x20: sub += ": .as"
 					if v&0x10: sub += ": .xs"
@@ -53,9 +53,10 @@ def seprep(code):
 		olines.append(": ".join(osubs))
 	return "\n".join(olines)
 
-def assemble(code):
+def assemble(code, globs=True):
 	p = subprocess.Popen("xa -w -o - /dev/stdin", stdin=subprocess.PIPE,
 		stdout=subprocess.PIPE, shell=True)
+	if globs: code = "\n".join([dump_globals(),code])
 	out, err = p.communicate(seprep(code))
 	return np.fromstring(out,dtype=np.uint8)
 
@@ -83,12 +84,28 @@ def input2bytes(s):
 	bits  = (chars != '.').astype(np.uint8)
 	return swapendian(np.packbits(bits)), s[:2]
 
+def add_globals(data):
+	"""Given a string containing simple assembly-style definitions
+	of the type foo = $bar, add them to a global, reusable dictionary."""
+	for entry in re.split("[:\n]+", data):
+		if entry[0] == "#": continue
+		m = re.search(r'\b(\w+)\s*=\s*(.*)',entry)
+		if m:
+			global_defs[m.group(1)] = m.group(2)
+		else:
+			raise ValueError("Unrecognized global format %s" % entry)
+def dump_globals():
+	return "\n".join(["%s = %s" % (k,v) for k,v in global_defs.items()])
+
 def ismacro(line): return line[0] == '@'
 def isnormal(line): return re.match("^..\|",line)
 def iscommand(line): return ismacro(line) or isnormal(line)
 def parse_int(s):
 	if s[0] == "$": s = "0x"+s[1:]
 	return int(s,0)
+def parse_glob(s):
+	if s in global_defs: s = global_defs[s]
+	return parse_int(s)
 def nbyte2nrec(i): return (i+2*npad-1)/(2*npad)
 
 lagframe = "|".join(["F."]+["."*16]*4)
@@ -115,7 +132,7 @@ class SubframeInput(RawInput):
 
 class Inline:
 	def __init__(self, args, data):
-		self.nlag = [parse_int(a) for a in args]
+		self.nlag = [parse_glob(a) for a in args]
 		self.asm  = data
 		self.code = assemble(data)
 	def toinput(self):
@@ -123,8 +140,8 @@ class Inline:
 
 class Boot:
 	def __init__(self, args, data):
-		self.addr = parse_int(args[0])
-		self.nlag = [parse_int(a) for a in args[1:]]
+		self.addr = parse_glob(args[0])
+		self.nlag = [parse_glob(a) for a in args[1:]]
 		self.payload_asm  = data
 		self.payload_code = assemble(data)
 		cpad = np.pad(self.payload_code,[0,self.payload_code.size%2],mode="constant")
@@ -158,8 +175,11 @@ class Function(Code):
 	def __init__(self, args, data):
 		self.payload_asm  = data
 		self.payload_code = assemble(data)
-		self.addr = parse_int(args[0])
-		self.bufsize = parse_int(args[1]) if len(args) > 1 else bufsize
+		self.addr = parse_glob(args[0])
+		try:
+			self.bufsize = parse_glob(args[1]) if len(args) > 1 else parse_glob("bufsize")
+		except KeyError:
+			raise ValueError("No input buffer size specified. Either specify as argument to function or define bufsize in a @global section.")
 		self.setnext(0)
 	def getcode(self):
 		ncopy, ncode = 17, len(self.payload_code)
@@ -213,7 +233,7 @@ def parse(lines):
 		if line[0] == '@':
 			toks = line.split()
 			data,n = getdata(lines[i+1:])
-			i += n+1
+			i += n
 			if toks[0] == "@inline":
 				entries.append(Inline(toks[1:], data))
 			elif toks[0] == "@boot":
@@ -222,6 +242,10 @@ def parse(lines):
 				entries.append(Code(toks[1:], data))
 			elif toks[0] == "@function":
 				entries.append(Function(toks[1:], data))
+			elif toks[0] == "@global":
+				add_globals(data)
+			else:
+				raise ValueError("Unrecognized command %s" % toks[0])
 		elif re.search("^..\|", line):
 			if line[0]=='F':
 				entries.append(NormalInput(line))
